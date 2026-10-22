@@ -29,13 +29,19 @@ MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5-5")
 app = FastAPI()
 client = AsyncAnthropic()  # reads ANTHROPIC_API_KEY
 
+def quote_ident(name):
+    return '"' + name.replace('"', '""') + '"'
+
 # ---------------------------------------------------------------- data access
 con = duckdb.connect(database=":memory:")
 TABLES = {}
 for csv in DATA.glob("*.csv"):
     name = csv.stem
-    con.execute(f"CREATE VIEW {name} AS SELECT * FROM read_csv_auto('{csv.as_posix()}')")
-    TABLES[name] = con.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]
+    con.execute(f"CREATE TABLE {quote_ident(name)} AS SELECT * FROM read_csv_auto('{csv.as_posix()}')")
+    TABLES[name] = con.execute(f"SELECT COUNT(*) FROM {quote_ident(name)}").fetchone()[0]
+# Data is loaded as real tables above; lock down filesystem/network access so
+# model-issued SQL can't read arbitrary files via read_csv_auto() etc.
+con.execute("SET enable_external_access=false")
 
 SOURCES = {}
 for md in sorted(DATA.glob("sources/*.md")):
@@ -51,7 +57,7 @@ for md in sorted(DATA.glob("sources/*.md")):
 def schema_text():
     out = []
     for name in TABLES:
-        cols = con.execute(f"DESCRIBE {name}").fetchall()
+        cols = con.execute(f"DESCRIBE {quote_ident(name)}").fetchall()
         out.append(f"table {name} ({TABLES[name]} rows): " + ", ".join(f"{c[0]} {c[1]}" for c in cols))
     return "\n".join(out)
 
@@ -133,6 +139,11 @@ class Run:
     async def edge(self, a, b):
         await self.emit(type="edge", a=a, b=b)
 
+    @staticmethod
+    def _run_sql(sql):
+        cur = con.execute(sql)
+        return cur.fetchall(), [d[0] for d in cur.description]
+
     # ---- tool implementations; each returns (text for the model, ids it minted)
     async def t_plan(self, inp):
         await self.node("plan", "plan", f"Plan: {len(inp['subtasks'])} sub-tasks", 1, 0,
@@ -147,20 +158,23 @@ class Run:
     async def t_query(self, inp):
         sql, lane = inp["sql"], self.lane_for_subtask(inp.get("subtask", 1))
         await self.emit(type="status", text=f"Querying: {inp['purpose']}")
-        tables = [t for t in TABLES if re.search(rf"\b{t}\b", sql)]
-        rin = sum(TABLES[t] for t in tables) or None
+        if not re.match(r"^\s*(select|with)\b", sql, re.I):
+            oid = self.new_id("q")
+            await self.node(oid, "caveat", f"Query failed: {inp['purpose'][:30]}", 3, lane,
+                            detail=f"{sql}\n\nERROR: read-only: only SELECT/WITH allowed")
+            return f"[{oid}] query error: read-only: only SELECT/WITH allowed"
+        tables = [t for t in TABLES if re.search(rf"\b{re.escape(t)}\b", sql)]
+        rin = sum(TABLES[t] for t in tables) if tables else None
         # source node for each table, once
         for t in tables:
             if t not in self.sources_seen:
                 sid = f"src_{t}"; self.sources_seen[t] = sid
                 await self.node(sid, "source", t, 2, lane, sub=f"{TABLES[t]} rows", rows=TABLES[t],
                                 detail=f"table {t}\n{TABLES[t]} rows\n\n" + "\n".join(
-                                    f"{c[0]}: {c[1]}" for c in con.execute(f'DESCRIBE {t}').fetchall()))
+                                    f"{c[0]}: {c[1]}" for c in con.execute(f"DESCRIBE {quote_ident(t)}").fetchall()))
                 await self.edge(f"task{inp.get('subtask', 1)}", sid)
         try:
-            if not re.match(r"^\s*(select|with)\b", sql, re.I):
-                raise ValueError("read-only: only SELECT/WITH allowed")
-            cur = con.execute(sql); rows = cur.fetchall(); cols = [d[0] for d in cur.description]
+            rows, cols = await asyncio.to_thread(self._run_sql, sql)
         except Exception as e:
             oid = self.new_id("q")
             await self.node(oid, "caveat", f"Query failed: {inp['purpose'][:30]}", 3, lane, detail=f"{sql}\n\nERROR: {e}")

@@ -35,5 +35,5 @@ Optional: `export CLAUDE_MODEL=claude-opus-5-5` (default is `claude-sonnet-5-5`)
 
 1. **Verification nodes.** After each `record_claim`, check that numbers in the claim appear in the cited tool outputs; emit a caveat node automatically when they don't. This catches the model mis-citing its own evidence.
 2. **Streaming.** Switch `client.messages.create` to `client.messages.stream` so the closing text types out and tool calls appear the instant they begin rather than when the turn ends.
-3. **Replace the corpus with live tools.** Web search, a SQL warehouse, a BI` semantic layer. The event vocabulary doesn't change; only the tool implementations do.
+3. **Replace the corpus with live tools.** Web search, a SQL warehouse, a BI semantic layer. The event vocabulary doesn't change; only the tool implementations do.
 4. **Persist runs** as the event list so an analyst can reopen yesterday's analysis and scrub through it.
